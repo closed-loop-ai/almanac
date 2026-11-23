@@ -84,7 +84,7 @@ Write the configuration file yourself:
 
 **Best for**: Complex requirements, advanced users
 
-[Learn More →](config-structure.md)
+Read the manual JSON example below for the current configuration structure and validation limits.
 
 ## Quick Example: Connecting a Data Source
 
@@ -103,32 +103,190 @@ Total time: **~2 minutes**
 
 ### Using JSON (Manual Method)
 
+An indexing configuration tells Almanac which MCP tools to call, how to select
+records from their responses, and how to map those records into stored documents.
+It is separate from the data source's connection and OAuth settings.
+
+This example follows the current [`SyncConfig` type](https://github.com/tryprotege/almanac/blob/849d8e0ae7fe2b9fcb75994094f1b211b96864c5/packages/indexing-engine/src/types/config.ts).
+Use it when you need a small, explicit configuration rather than a generated one.
+The example reads selected product insights from [ClosedLoop AI](https://closedloop.sh/).
+It is a manual configuration example, not a claim that this connection has been
+tested against a live workspace.
+
+#### Choose a bounded input
+
+ClosedLoop AI exposes `get_insight`, a read tool that accepts one full insight ID
+and returns its title, content, and supporting context. That makes it suitable for
+an operator-selected collection: for example, the product insights chosen for one
+planning review. The example fetches those IDs again when the configuration runs.
+
+It does not discover every insight in a workspace. A ranked search result is not
+a complete inventory, and Almanac normally skips tools classified as `search`
+during indexing. Keep `get_insight` classified as `read`; do not change a search
+tool's category to make it run.
+
+Before using real IDs, connect an authorized ClosedLoop AI workspace through the
+normal data source setup and review which data Almanac will retain. Connection,
+OAuth consent, and a live tool call are outside this example. Do not put tokens
+or other connection credentials in the indexing configuration.
+
+#### Write the configuration
+
+The following JSON is the `SyncConfig` object, not the enclosing connection
+configuration. Use the configured MCP data source's name consistently for
+`source`; `closedloop-ai` is the example name here.
+
 ```json
 {
   "version": "1.0",
-  "source": "my-api",
-  "displayName": "My Custom API",
+  "source": "closedloop-ai",
+  "displayName": "Selected ClosedLoop AI product insights",
+  "startingPoints": [
+    {
+      "name": "insightIds",
+      "description": "Full IDs of the product insights selected for this collection",
+      "required": true,
+      "userProvided": true
+    }
+  ],
   "fetchers": {
-    "list_items": {
-      "tool": "list_items",
-      "outputs": "items",
-      "recordType": "item"
+    "selected_insights": {
+      "tool": "get_insight",
+      "seedFrom": {
+        "startingPoint": "insightIds",
+        "paramMapping": {
+          "id": "$"
+        },
+        "concurrency": 1,
+        "continueOnError": false
+      },
+      "resultPath": "$.content[0].text",
+      "arrayPath": "$"
     }
   },
   "recordTypes": {
-    "item": {
+    "insight": {
+      "name": "insight",
+      "fetcher": "selected_insights",
+      "idField": "$.id",
+      "detection": {
+        "condition": "typeof record.id === 'string' && typeof record.title === 'string' && typeof record.content === 'string'"
+      },
       "fields": {
-        "title": "$.name",
-        "content": "$.description",
-        "sourceId": "$.id",
-        "primaryDate": "$.created_at"
+        "title": {
+          "type": "path",
+          "path": "$.title"
+        },
+        "content": {
+          "type": "path",
+          "path": "$.content"
+        }
       }
     }
-  }
+  },
+  "toolClassifications": {
+    "get_insight": {
+      "toolName": "get_insight",
+      "category": "read"
+    }
+  },
+  "syncOrder": ["selected_insights"]
 }
 ```
 
-Total time: **~10-30 minutes** (depending on complexity)
+Starting point values are stored separately from that object. These two full IDs
+are synthetic fixtures, not existing product insights:
+
+```json
+{
+  "insightIds": [
+    "11111111-1111-4111-8111-111111111111",
+    "22222222-2222-4222-8222-222222222222"
+  ]
+}
+```
+
+Supply the `insightIds` key with your selected values through the normal starting
+point input. Do not paste the synthetic IDs into a live sync and expect records.
+The stored configuration model keeps these values in `startingPointValues`.
+
+#### Follow one record through the configuration
+
+1. `seedFrom.startingPoint` names the input collection. For a string starting
+   value, the fetcher treats `$` as the whole value and supplies it as the tool's
+   `id` argument. `concurrency: 1` processes the selected values sequentially.
+2. The MCP tool result contains a text block holding JSON. `resultPath` records
+   that expected envelope. The current fetcher parses the text block directly;
+   `resultPath` is not an arbitrary response transformation mechanism.
+3. `arrayPath: "$"` selects the whole parsed object as one record. A tool returning
+   an object containing an array would need a path to the array's individual
+   entries instead.
+4. `recordTypes.insight.fetcher` associates the record type with the fetcher key.
+   The detection expression admits objects with the three expected string fields.
+   Detection expressions are executable configuration: review them as code.
+5. `idField` selects the source ID. `fields.title` and `fields.content` are mapping
+   objects, not bare JSONPath strings. No `fields.sourceId` mapping is needed.
+
+For example, an MCP text block could contain this synthetic payload:
+
+```json
+{
+  "id": "11111111-1111-4111-8111-111111111111",
+  "title": "Explain a saved filter before sharing it",
+  "content": "The planning review selected a product insight about making saved filter conditions visible before a view is shared."
+}
+```
+
+With data source name `closedloop-ai`, transformation produces the identity
+`closedloop-ai_insight_11111111-1111-4111-8111-111111111111`, the same source ID,
+and the payload's title and content. Re-fetching the same source ID and record
+type under the same data source name targets the same stored `_id`.
+
+#### Understand storage and updates
+
+The transformer builds `_id` from the actual data source name, record type name,
+and source ID. Keep those names stable if subsequent runs should update the same
+records. The sync storage path upserts by `_id`, replaces the stored fields, and
+increments the stored version. Renaming the source or record type changes the
+identity; this example does not provide a migration between names.
+
+This example omits incremental sync and source timestamps. The insight's source
+date is not an update cursor. Selected-ID reads do not establish a complete
+workspace inventory or a deletion policy. Removing an ID from the input list is
+not an instruction to delete its previously stored record.
+
+Field selection is not redaction. The transformer also retains the original
+record in `rawData`, and real insight responses can contain evidence, customer
+details, or conversation references beyond the mapped title and content. Review
+workspace access, storage, and logging before using real data. Do not use a real
+response as a public test fixture.
+
+#### Validate in layers
+
+- Check the object against `SyncConfig`, including required `resultPath`,
+  `recordTypes.*.name`, `fetcher`, `detection`, and the mapping object shapes.
+- Exercise response parsing and transformation with synthetic MCP text results.
+  Check the expected ID, title, content, and retained raw record. Include a missing
+  ID, a changed title with the same ID, and an empty selected-ID list.
+- Treat the import screen's JSON/shape check as an initial check. The current dry
+  run fetches a page directly; it does not exercise this `seedFrom` loop and its
+  supplied starting points. A green import message alone does not validate this
+  selected-ID workflow.
+- After connection and data access are authorized, separately test a small
+  selected set through the real connection. Inspect failures and the resulting
+  records before expanding it. No live connection check is reported here.
+
+`continueOnError: false` makes a rejected selected-value call stop that fetcher's
+collection. It does not make a complete sync transactional, disable retries in
+the MCP client, or turn a returned error payload into a thrown exception.
+
+For the implementation behind these details, see the
+[`seedFrom` fetcher](https://github.com/tryprotege/almanac/blob/849d8e0ae7fe2b9fcb75994094f1b211b96864c5/packages/server/src/services/indexing/config/paginated-fetcher.ts),
+[record transformer](https://github.com/tryprotege/almanac/blob/849d8e0ae7fe2b9fcb75994094f1b211b96864c5/packages/indexing-engine/src/executor/transformer.ts),
+[configuration validator](https://github.com/tryprotege/almanac/blob/849d8e0ae7fe2b9fcb75994094f1b211b96864c5/packages/server/src/services/indexing/config/config-validator.service.ts),
+and [sync storage path](https://github.com/tryprotege/almanac/blob/849d8e0ae7fe2b9fcb75994094f1b211b96864c5/packages/server/src/services/sync/sync.service.ts).
+
+Contributed by ClosedLoop Labs LLC, the company behind ClosedLoop AI.
 
 ## Built-In MCP Servers
 
@@ -428,7 +586,7 @@ Solution: Verify OAuth configuration
 ## Next Steps
 
 - **[Auto-Configuration Guide](auto-config.md)** - Let Almanac generate configs
-- **[Config Structure](config-structure.md)** - Understand the JSON format
+- **Manual JSON example on this page** - Understand the configuration format and validation limits
 - **[Creating Servers](creating-servers.md)** - Build your own MCP server
 - **[Testing & Validation](testing.md)** - Ensure your config works
 
